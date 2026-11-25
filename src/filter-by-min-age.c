@@ -1,107 +1,198 @@
-// Filters CSV rows, keeping only those with given maximum age
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-constexpr size_t LINE_MAX = 100; // Maximum line length
-const char DELIMITER[] = ",";    // CSV delimiter
+enum { LINE_SIZE = 4096 };
 
-char *ifile, *ofile;
-unsigned filter_age_min;
-FILE *istream, *ostream;
+static int parse_unsigned(const char *text, unsigned *value) {
+  char *end;
+  unsigned long parsed;
 
-const char USAGE[] =
-    R"(Filters CSV rows, keeping only those with given minimum age
-%s minimum-age [input-file] [output-file]
+  if (!text || !*text)
+    return 0;
+  for (const char *p = text; *p; ++p) {
+    if (!isdigit((unsigned char)*p))
+      return 0;
+  }
 
-Example: 
-%s 18 input.csv output.csv
-%s 18 input.csv (outputs to stdout)
-%s 18           (inputs from stdin, outputs to stdout)
-)";
+  errno = 0;
+  parsed = strtoul(text, &end, 10);
+  if (errno == ERANGE || *end != '\0' || parsed > UINT_MAX)
+    return 0;
 
-void filter_stream(FILE *istream, FILE *ostream) {
-  char line[LINE_MAX];
-  char *fgets_return;
-  char *name, *age_str;
+  *value = (unsigned)parsed;
+  return 1;
+}
+
+static int parse_record(char *line, char *name, size_t name_size,
+                        unsigned *age) {
+  char *p = line;
+  size_t name_length = 0;
+
+  if (*p == '"') {
+    ++p;
+    while (*p) {
+      if (*p == '"') {
+        if (p[1] == '"') {
+          if (name_length + 1 >= name_size)
+            return 0;
+          name[name_length++] = '"';
+          p += 2;
+        } else {
+          ++p;
+          break;
+        }
+      } else {
+        if (name_length + 1 >= name_size)
+          return 0;
+        name[name_length++] = *p++;
+      }
+    }
+    if (p[-1] != '"' || *p != ',')
+      return 0;
+    ++p;
+  } else {
+    char *comma = strchr(p, ',');
+    if (!comma)
+      return 0;
+    name_length = (size_t)(comma - p);
+    if (name_length >= name_size || memchr(p, '"', name_length))
+      return 0;
+    memcpy(name, p, name_length);
+    p = comma + 1;
+  }
+
+  name[name_length] = '\0';
+  if (name_length == 0)
+    return 0;
+
+  while (isspace((unsigned char)*p))
+    ++p;
+  if (!isdigit((unsigned char)*p))
+    return 0;
+
+  errno = 0;
+  char *end;
+  unsigned long parsed_age = strtoul(p, &end, 10);
+  if (errno == ERANGE || parsed_age > UINT_MAX)
+    return 0;
+  while (isspace((unsigned char)*end))
+    ++end;
+  if (*end != '\0')
+    return 0;
+
+  *age = (unsigned)parsed_age;
+  return 1;
+}
+
+static int write_record(FILE *ostream, const char *name, unsigned age) {
+  int needs_quotes = strpbrk(name, ",\"") != NULL;
+  if (needs_quotes && fputc('"', ostream) == EOF)
+    return 0;
+
+  for (const char *p = name; *p; ++p) {
+    if (*p == '"' && fputc('"', ostream) == EOF)
+      return 0;
+    if (fputc(*p, ostream) == EOF)
+      return 0;
+  }
+
+  if (needs_quotes && fputc('"', ostream) == EOF)
+    return 0;
+  return fprintf(ostream, ", %u\n", age) >= 0;
+}
+
+static int filter_stream(FILE *istream, FILE *ostream, unsigned minimum_age) {
+  char line[LINE_SIZE];
+  char name[LINE_SIZE];
   size_t line_no = 0;
 
-  while ((fgets_return = fgets(line, LINE_MAX, istream))) {
+  while (fgets(line, sizeof line, istream)) {
     ++line_no;
-
-    if (*fgets_return != '\n') {
-      if (strlen(line) > 1) {
-        name = strtok(line, DELIMITER);
-        age_str = strtok(nullptr, DELIMITER);
-
-        // Alternative to strtok:
-        // sscanf(line, "%*[^,],%d", &age);
-
-        if (!age_str) {
-          fprintf(stderr, "Line %zu: Age missing.\n", line_no);
-        }
-      }
+    size_t length = strlen(line);
+    if (length > 0 && line[length - 1] == '\n') {
+      line[--length] = '\0';
     } else {
-      // Error
-      fprintf(stderr, "Line %zu: Whole line missing.\n", line_no);
+      int next = fgetc(istream);
+      if (next != EOF) {
+        while (next != '\n' && next != EOF)
+          next = fgetc(istream);
+        fprintf(stderr, "Line %zu: Row exceeds maximum length.\n", line_no);
+        continue;
+      }
+    }
+
+    if (length > 0 && line[length - 1] == '\r')
+      line[--length] = '\0';
+
+    unsigned age;
+    if (!parse_record(line, name, sizeof name, &age)) {
+      fprintf(stderr, "Line %zu: Invalid CSV row or age.\n", line_no);
       continue;
     }
 
-    // Age processing
-    unsigned age;
-    auto recognized_count = sscanf(age_str, "%d", &age);
-    if (recognized_count == 1) {
-      if (age >= filter_age_min)
-        // Forward input line to `ostream`
-        fprintf(ostream, "%s, %d\n", name, age);
-    } else {
-      // Error
-      fprintf(stderr, "Line %zu: Age value is not a number.\n", line_no);
+    if (age >= minimum_age && !write_record(ostream, name, age)) {
+      perror("Writing output");
+      return 0;
     }
   }
+
+  if (ferror(istream)) {
+    perror("Reading input");
+    return 0;
+  }
+  return 1;
 }
 
 int main(int argc, char *argv[]) {
-  switch (argc) {
-  case 4:
-    // minimum-age ifile ofile
-    ofile = argv[3];
-  case 3:
-    // minimum-age ifile
-    ifile = argv[2];
-  case 2:
-    // minimum-age
-    if (!sscanf(argv[1], "%d", &filter_age_min)) {
-      puts("First argument is not an age.");
-      exit(EXIT_FAILURE);
-    }
-    break;
-  default:
-    printf(USAGE, argv[0], argv[0], argv[0], argv[0]);
-    return EXIT_SUCCESS;
+  unsigned minimum_age;
+  FILE *istream = stdin;
+  FILE *ostream = stdout;
+  int success;
+
+  if (argc < 2 || argc > 4) {
+    fprintf(stderr,
+            "Usage: %s minimum-age [input-file] [output-file]\n"
+            "Example: %s 18 input.csv output.csv\n",
+            argv[0], argv[0]);
+    return EXIT_FAILURE;
   }
 
-  // Input file
-  if (ifile) {
-    istream = fopen(ifile, "r");
+  if (!parse_unsigned(argv[1], &minimum_age)) {
+    fprintf(stderr, "Minimum age must be a non-negative integer.\n");
+    return EXIT_FAILURE;
+  }
 
+  if (argc >= 3) {
+    istream = fopen(argv[2], "r");
     if (!istream) {
-      perror("");
-      exit(EXIT_FAILURE);
+      perror(argv[2]);
+      return EXIT_FAILURE;
     }
-  } else // No file provided
-    istream = stdin;
+  }
 
-  // Output file
-  if (ofile) {
-    ostream = fopen(ofile, "w");
-
+  if (argc == 4) {
+    ostream = fopen(argv[3], "w");
     if (!ostream) {
-      perror("");
-      exit(EXIT_FAILURE);
+      perror(argv[3]);
+      if (istream != stdin)
+        fclose(istream);
+      return EXIT_FAILURE;
     }
-  } else
-    ostream = stdout;
+  }
 
-  filter_stream(istream, ostream);
+  success = filter_stream(istream, ostream, minimum_age);
+  if (istream != stdin && fclose(istream) == EOF) {
+    perror("Closing input");
+    success = 0;
+  }
+  if (ostream != stdout && fclose(ostream) == EOF) {
+    perror("Closing output");
+    success = 0;
+  }
+
+  return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }
